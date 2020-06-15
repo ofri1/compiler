@@ -1,0 +1,1658 @@
+%{
+	#include "parser.hpp"
+	#include "output.hpp"
+	#include "boost/lexical_cast.hpp"
+	#include <algorithm>
+	
+	#include <utility>
+	
+	
+	#define YYERROR_VERBOSE 1
+	#define YYDEBUG 1
+	
+
+	using namespace std;
+	using namespace output;
+	
+
+	extern int yylex();
+	extern int yylineno;
+	extern char* yytext;
+	void yyerror(const char * message);
+	
+	// Global Variables:
+	
+	vector <SymbolTable*>* tables = new vector < SymbolTable* >();
+	stack <int>* offset_stack = new stack <int>();
+	string ret_type = "";
+	
+	// HW5 Global Variables:
+	
+	bool* av_regs = new bool[26];
+	CodeBuffer &code = CodeBuffer::instance();
+	int string_count = 0;
+	vector<int>* while_tables = new vector<int>();
+	
+	
+	// Functions:
+	
+	Info* get_struct_info(string id);
+	
+	void check_exp_type(YYSTYPE exp,string type);
+	
+	void check_params(vector<string> expect, vector<string> recieved,string id);
+	
+	void check_id_free(string id);
+	
+	string get_exp_type(YYSTYPE exp);
+	
+	Info* get_info(string name);
+	
+	string get_binop_result(string num1,string num2,string op);
+		
+	void end_scope();
+	
+	int is_struct_field(string struct_ID,string field);
+	
+	string get_struct_field_type(string struct_ID, string name);
+	
+	vector<string>* get_struct_fields(vector< pair <string,string> > fields, int x);
+	
+	vector <string>* add_struct_to_args(vector<string>* args); 
+	
+	void init_regs();
+	
+	void set_reg_available(int i, bool b);
+	
+	int get_free_reg();
+	
+	bool is_reg_free(int i);
+	
+	string to_str(int num);
+	
+	void empty_stack(SymbolTable* current_table);
+	
+	void empty_func_stack();
+	
+	void empty_while_stack(int index);
+
+%}
+
+
+%token VOID
+%token INT
+%token BYTE
+%token B
+%token BOOL
+%token STRUCT
+%token TRUE
+%token FALSE
+%token RETURN
+%token IF
+%nonassoc CONFLICT
+%nonassoc ELSE
+%token WHILE
+%token BREAK
+%token CONTINUE
+%token SC
+%token COMMA
+%left PERIOD
+%token ID
+%token NUM
+%token STRING
+%right ASSIGN
+%left AND
+%left OR
+%left RELOPL
+%nonassoc RELOPN
+%left ADDSUB
+%left MULDIV
+%right NOT
+%token LPAREN
+%token RPAREN
+%token LBRACE
+%token RBRACE
+
+
+%%
+
+
+Program	:	M Structs Funcs  // 1
+		{
+			Info* main_info = get_info("main");
+			
+			if (main_info==NULL || main_info->type!="VOID" || main_info->arg_types==NULL ||  main_info->arg_types->size()!=0){
+				errorMainMissing();
+				exit(0);
+			}
+			
+			// HW5 - pop first tables
+			offset_stack->pop();
+			tables->pop_back();
+
+		}
+	;
+	
+	
+M : /* Epsilon */
+		{
+			
+		// Global scope
+		SymbolTable* table = new SymbolTable();
+		tables->push_back(table);
+		offset_stack->push(0);
+		
+		// HW5 - Initialize registers
+		init_regs();
+		
+		// Insert print
+		vector<string>* args1 = new vector<string>();
+		args1->push_back("STRING");
+		Info* info1 = new Info("print","VOID",0,args1,NULL);
+		(tables->back())->push_back(info1);
+				
+		// Insert printi
+		vector<string>* args2 = new vector<string>();
+		args2->push_back("INT");
+		Info* info2 = new Info("printi","VOID",0,args2,NULL);
+		(tables->back())->push_back(info2);
+		
+		// HW5:
+					
+		// print
+		code.emit("print_:");
+		code.emit("lw $a0, 0($sp)");
+		code.emit("li $v0, 4");
+		code.emit("syscall");
+		code.emit("addu $sp, $sp, 4");
+		code.emit("jr $ra");
+		
+		// printi
+		code.emit("printi_:");
+		code.emit("lw $a0, 0($sp)");
+		code.emit("li $v0, 1");
+		code.emit("syscall");
+		code.emit("addu $sp, $sp, 4");
+		code.emit("jr $ra");
+		
+			
+		code.emitData("div_zero_error: .asciiz \"Error division by zero\\n\"");
+		code.emit("div_zero :");
+		code.emit("la $a0, div_zero_error");
+		code.emit("li $v0, 4"); // Syscall to print
+		code.emit("syscall");
+		code.emit("li $v0, 10"); // Syscall to terminate
+		code.emit("syscall");			
+	
+		}
+		
+	;
+	
+	
+OpenScope : /* Epsilon */
+		{
+		
+			SymbolTable* table = new SymbolTable();
+			tables->push_back(table);
+			offset_stack->push(offset_stack->top());
+		}
+		;
+		
+EndScope : /* Epsilon */
+		{
+			end_scope();	
+		}
+		;
+		
+// HW5
+
+Mlabel	: /* Epsilon */
+		{
+				$$ = new Node("Label");
+				$$->label = code.genLabel();
+		}
+		;
+		
+N		: /* Epsilon */
+		{
+			$$ = new Node("N");
+			$$ -> next_list = code.makelist(code.emit("j  "));
+		}
+		;
+		
+OpenWhile	: /* Epsilon */
+		{
+			while_tables->push_back(tables->size());
+		}
+		;
+	
+Funcs : // 2 - Epsilon
+		| FuncDecl Funcs  // 3
+		{
+			
+		}
+		;
+		
+		
+FuncDecl : RetType ID LPAREN Formals RPAREN LBRACE // 4
+			{
+				string id = dynamic_cast<Value_node*>($2)->value;
+				check_id_free(id);
+			
+				vector<string>* types = new vector<string>(*dynamic_cast<Mem_list*>($4)->types);
+				vector<string>* names = new vector<string>(*dynamic_cast<Mem_list*>($4)->names);
+				
+				Info* new_info = new Info(dynamic_cast<Value_node*>($2)->value,$1->type,0,types,NULL);
+				(tables->back())->push_back(new_info);
+				
+				
+				SymbolTable* table = new SymbolTable();
+				tables->push_back(table);
+				offset_stack->push(0);
+				
+				int offset = 0;
+				
+				for (int i=0; i<types->size(); i++){
+					check_id_free(names->at(i));
+
+					string type = types->at(i);
+					if (type!="INT" && type!="BYTE" && type!="BOOL")
+					{
+						Info* struct_info = get_struct_info(type);
+						int size = struct_info->struct_fields->size();
+						
+						offset-=size;
+						vector< pair <string, string> >* fields = new vector< pair <string, string> >(*(struct_info->struct_fields));
+						(tables->back())->push_back(new Info(names->at(i),type,offset,NULL,fields));
+						
+						
+					}
+					else{
+						offset-=1;
+						(tables->back())->push_back(new Info(names->at(i),type,offset,NULL,NULL));
+						
+					}
+				}
+				
+				if (id == "main") {
+					code.emit("main:");
+					code.emit("subu $fp, $sp, 4");
+				}
+				else code.emit(id+"_:");
+				
+				
+			} Statements RBRACE  
+			{
+				code.bpatch($8->next_list,code.genLabel());
+				end_scope();
+				
+				for (int i=8; i<=25; i++){ // Free up all registers
+					set_reg_available(i,true);
+				}
+				
+				code.emit("jr $ra");
+			}
+		;
+		
+BoolExp : Exp
+		{
+			check_exp_type($1,"BOOL");
+			$$=$1;
+		}
+		
+Structs : // 5 - Epsilon
+		| StructsDecl Structs // 6
+		;
+		
+StructsDecl : STRUCT ID	{check_id_free(dynamic_cast<Value_node*>($2)->value);} LBRACE StructMemList RBRACE SC // 7
+		{
+			string id = dynamic_cast<Value_node*>($2)->value;
+			
+			vector<string> types = *(dynamic_cast<Mem_list*>($5)->types);
+			vector<string> names = *(dynamic_cast<Mem_list*>($5)->names);
+			
+			vector< pair <string, string> >* vec = new vector< pair <string, string> >();
+			
+			for (int i=0; i<types.size();i++){
+				vec->push_back(pair<string,string>(types.at(i),names.at(i)));
+			}
+			
+			Info* new_info = new Info(id,"STRUCT",offset_stack->top(),NULL,vec);
+			(tables->back())->push_back(new_info);
+			
+		}
+		;
+		
+RetType	: Type // 8
+		{
+			$$ = $1;
+			ret_type=$1->type;
+		}
+		
+		| VOID // 9
+		{
+			$$ = new Node("VOID");
+			ret_type="VOID";
+		}
+		;
+		
+Formals : // 10 - Epsilon
+		{
+			vector<string>* temp = new vector<string>();
+			$$ = new Mem_list(temp,temp);
+			delete temp;
+		}
+
+		| FormalsList // 11
+		{
+			$$ = $1;
+		}
+		;
+		
+FormalsList : FormalDecl // 12
+			{
+				$$ = new Mem_list($1->type,dynamic_cast<Value_node*>($1)->value);
+			}
+			
+			| FormalsList COMMA FormalDecl // 13
+			{
+				vector<string>* types = dynamic_cast<Mem_list*>($1)->types;
+				vector<string>* names = dynamic_cast<Mem_list*>($1)->names;
+				
+				$$ = new Mem_list(types,names);
+				
+				if (find(names->begin(),names->end(),dynamic_cast<Value_node*>($3)->value)!=names->end()){
+					errorDef(yylineno,dynamic_cast<Value_node*>($3)->value);
+					exit(0);
+				}
+				dynamic_cast<Mem_list*>($$)->types->push_back($3->type);
+				dynamic_cast<Mem_list*>($$)->names->push_back(dynamic_cast<Value_node*>($3)->value);
+
+			}
+		;
+		
+		
+		
+FormalDecl : Type ID // 14
+		{
+			$$ = new Value_node($1->type,dynamic_cast<Value_node*>($2)->value);
+		}
+		
+		| StructType ID // 15
+		{
+			$$ = new Value_node($1->type,dynamic_cast<Value_node*>($2)->value);
+		}
+	;
+		
+StructMemList : StructMem // 16
+		{
+			$$ = new Mem_list($1->type,dynamic_cast<Value_node*>($1)->value);
+		}
+		
+		| StructMemList StructMem  // 17
+		{
+			vector<string>* types = dynamic_cast<Mem_list*>($1)->types;
+			vector<string>* names = dynamic_cast<Mem_list*>($1)->names;
+			
+			if (find(names->begin(),names->end(),dynamic_cast<Value_node*>($2)->value) != names->end()){
+				errorDef(yylineno,dynamic_cast<Value_node*>($2)->value);
+					exit(0);
+			}
+			
+			$$ = new Mem_list(types,names);
+			
+			dynamic_cast<Mem_list*>($$)->types->push_back($2->type);
+			dynamic_cast<Mem_list*>($$)->names->push_back(dynamic_cast<Value_node*>($2)->value);
+			
+		}
+		;
+		
+StructMem : Type ID SC // 18
+		{
+			$$ = new Value_node($1->type,dynamic_cast<Value_node*>($2)->value);
+		}
+		;
+		
+Statements : Statement // 19
+		{
+			$$ = $1;
+		}
+		
+		| Statements { if ($1->next_list.size()>0) code.bpatch($1->next_list,code.genLabel());}  Statement // 20
+		{
+			$$ = $1;
+			$$->next_list = $3->next_list;
+			$$->break_list = code.merge($1->break_list,$3->break_list);
+			$$->continue_list = code.merge($1->continue_list,$3->continue_list);
+		}
+		;
+		
+Statement : 
+				
+		 LBRACE OpenScope Statements RBRACE Mlabel EndScope// 21
+		{
+			// HW5
+			
+			code.bpatch($3->next_list,$5->label);
+			
+			$$ = $3;
+			$$->next_list = vector<int>();
+			
+		}
+		
+		| Type ID SC // 22
+		{
+			string id = dynamic_cast<Value_node*>($2)->value;
+			
+			check_id_free(id);
+			
+			int top = offset_stack->top();
+			Info* new_info = new Info(id,$1->type,offset_stack->top(),NULL,NULL);
+			(tables->back())->push_back(new_info);
+
+			offset_stack->pop();
+			offset_stack->push(top+1);
+			
+			// HW5
+			
+			$$ = new Node("STATEMENT");
+			
+			code.emit("subu $sp, $sp, 4"); // Move stack pointer
+			code.emit("sw $0, 0($sp)"); // Initialize to zero
+		}
+		
+		| StructType ID SC //23
+		{
+			string id = dynamic_cast<Value_node*>($2)->value;
+			check_id_free(id);
+						
+			int size = get_struct_info($1->type)->struct_fields->size();
+			
+			int top = offset_stack->top();
+			Info* new_info = new Info(id,$1->type,offset_stack->top(),NULL,NULL);
+			(tables->back())->push_back(new_info);
+			offset_stack->pop();
+			offset_stack->push(top+size);
+			
+			for (int i=0; i<size;i++){
+				code.emit("subu $sp, $sp, 4"); // Move stack pointer
+				code.emit("sw $0, 0($sp)"); // Initialize to zero
+			}
+			
+		}
+		
+		| STRUCT ID	{check_id_free(dynamic_cast<Value_node*>($2)->value);} LBRACE StructMemList RBRACE SC //24
+		{
+			string id = dynamic_cast<Value_node*>($2)->value;
+			vector<string>* types = dynamic_cast<Mem_list*>($5)->types;
+			vector<string>* names = dynamic_cast<Mem_list*>($5)->names;
+			
+			vector< pair < string,string > >* vec = new vector< pair < string,string > >();
+			
+			for (int i=0; i<types->size();i++){
+				vec->push_back(pair<string,string>(types->at(i),names->at(i)));
+			}
+			
+			Info* new_info = new Info(id,"STRUCT",0,NULL,vec);
+			(tables->back())->push_back(new_info);	
+			
+		}
+		
+		| Type ID ASSIGN Exp SC // 25
+		{
+			string id = dynamic_cast<Value_node*>($2)->value;
+			
+			check_id_free(id);
+			
+			string type = get_exp_type($4);
+			
+			if (type != $1->type && !($1->type=="INT" && type=="BYTE")){
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			
+			int top = offset_stack->top();
+			Info* new_info = new Info(id,$1->type,top,NULL,NULL);
+			(tables->back())->push_back(new_info);
+			offset_stack->pop();
+			offset_stack->push(top+1);
+			
+			// HW5
+			
+			
+			if (type=="BOOL"){ // If bool, backpatch the bool statement to enter true/false into the stack
+				code.bpatch($4->true_list,code.genLabel());
+				code.emit("subu $sp, $sp, 4"); // Allocate stack space
+				int reg = get_free_reg();
+				code.emit("li $" + to_str(reg) + ", 1");
+				code.emit("sw $"+ to_str(reg) +", 0($sp)");
+				set_reg_available(reg,true);
+				$$->next_list = code.makelist(code.emit("j  "));
+				code.bpatch($4->false_list,code.genLabel());
+				code.emit("subu $sp, $sp, 4"); // Allocate stack space
+				code.emit("sw $0, 0($sp)");
+			}
+			
+			else{
+				code.emit("subu $sp, $sp, 4"); // Allocate stack space
+				code.emit("sw $" + to_str($4->reg) + ", 0($sp)");
+				set_reg_available($4->reg,true);
+			}
+		}
+		
+		| StructType ID ASSIGN Exp SC // 26
+		{
+			string id = dynamic_cast<Value_node*>($2)->value;
+			
+			check_id_free(id);
+			
+			check_exp_type($4,$1->type);
+			
+			Info* struct_info = get_struct_info($1->type);
+			
+			// Adding to table
+			int top = offset_stack->top();
+			Info* new_info = new Info(id, $1->type, top,NULL,NULL);
+			(tables->back())->push_back(new_info);
+			offset_stack->pop();
+			offset_stack->push(top+struct_info->struct_fields->size());
+			
+			vector<string> arg_types = *(get_struct_fields(*(struct_info->struct_fields),1));
+			
+			Info* exp_info = get_info(dynamic_cast<Value_node*>($4)->value);
+			
+			int reg = get_free_reg();
+			
+			for (int i=0; i<struct_info->struct_fields->size();i++){		
+				code.emit("lw $" + to_str(reg) + ", "+ to_str(-4*(exp_info->offset+i))+ "($fp)");
+				code.emit("subu $sp, $sp, 4"); // Move stack pointer
+				code.emit("sw $" + to_str(reg) + ", 0($sp)"); 
+			}
+			
+			set_reg_available(reg,true);
+			
+		}
+		
+		| ID ASSIGN Exp SC // 27
+		{
+			string id = dynamic_cast<Value_node*>($1)->value;
+			Info* id_info = get_info(id);
+			
+			if (id_info == NULL || id_info->arg_types!=NULL)
+			{
+				errorUndef(yylineno,id);
+				exit(0);
+			}
+			
+			string exp_type = get_exp_type($3);
+			
+			if (exp_type != id_info->type && !(exp_type =="BYTE" && id_info->type=="INT"))
+			{
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			
+			// HW5
+			
+			Info* struct_info = get_struct_info(id_info->type);
+			
+			if (struct_info != NULL){
+				
+				Info* exp_info = get_info(dynamic_cast<Value_node*>($3)->value);
+				
+				int reg = get_free_reg();
+			
+				for (int i=0; i<struct_info->struct_fields->size();i++){		
+					code.emit("lw $" + to_str(reg) + ", "+ to_str(-4*(exp_info->offset+i))+ "($fp)");
+					code.emit("sw $" + to_str(reg) + ", " + to_str(-4*(id_info->offset+i))+ "($fp)"); 
+				}
+			
+				set_reg_available(reg,true);
+			}
+			
+			else if (exp_type == "BOOL") // If bool, backpatch the bool statement to enter true/false to the var stack position
+			{
+				code.bpatch($3->true_list,code.genLabel());
+				int reg = get_free_reg();
+				code.emit("li $" + to_str(reg) + ", 1");
+				code.emit("sw $"+ to_str(reg) +"," + to_str(-4 * id_info->offset) + "($fp)");
+				set_reg_available(reg,true);
+				$$->next_list = code.makelist(code.emit("j  "));
+				code.bpatch($3->false_list,code.genLabel());
+				code.emit("sw $0," + to_str(-4 * id_info->offset) + "($fp)");
+			}
+			
+			else {
+				code.emit("sw $" + to_str($3->reg) + "," + to_str(-4 * id_info->offset) + "($fp)");
+				set_reg_available($3->reg, true);
+			}
+			
+			
+			
+		}
+		
+		| ID PERIOD ID ASSIGN Exp SC // 28
+		{
+			
+			string id = dynamic_cast<Value_node*>($1)->value;
+			
+			Info* id_info = get_info(id);
+			
+			if (id_info == NULL)
+			{
+				errorUndef(yylineno,id);
+				exit(0);
+			}
+			
+			string field = dynamic_cast<Value_node*>($3)->value;
+			
+			if (get_struct_info(id_info->type) == NULL){
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			
+			int inside_offset = is_struct_field(id_info->type,field);
+			
+			if ( inside_offset == -1){
+				errorUndefStructMember(yylineno,id);
+				exit(0);
+			}
+			
+			string field_type = get_struct_field_type(id_info->type,field);
+			string exp_type = get_exp_type($5);
+			
+			if (exp_type != field_type && !(field_type=="INT" && exp_type=="BYTE")){
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			
+			if (exp_type == "BOOL"){
+				code.bpatch($5->true_list,code.genLabel());
+				int reg = get_free_reg();
+				code.emit("li $" + to_str(reg) + ", 1");
+				code.emit("sw $" + to_str(reg) + "," + to_str(-4 * (id_info->offset + inside_offset)) + "($fp)");
+				set_reg_available(reg,true);
+				$$->next_list = code.makelist(code.emit("j  "));
+				code.bpatch($5->false_list,code.genLabel());
+				code.emit("sw $0," + to_str(-4 * (id_info->offset + inside_offset)) + "($fp)");
+			}
+			
+			else code.emit("sw $" + to_str($5->reg) + "," + to_str(-4 * (id_info->offset + inside_offset)) + "($fp)");
+			
+			set_reg_available($5->reg,true);
+		}
+		
+		| Call SC //29
+		{
+			$$ = new Node("STATEMENT");
+			set_reg_available($1->reg,true);
+			$$->next_list = code.merge($1->true_list,$1->false_list);
+		}
+		
+		| RETURN SC //30
+		{
+			if (ret_type!="VOID")
+			{
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			
+			for (int i=8; i<=25; i++){ // Free up all registers
+				set_reg_available(i,true);
+			}
+			
+			$$ = new Node("RETURN");
+			
+			empty_func_stack();
+				
+			code.emit("jr $ra");
+			
+		}
+		
+		| RETURN Exp SC // 31
+		{
+			if (ret_type!=get_exp_type($2) && !(ret_type=="INT" && get_exp_type($2)=="BYTE"))
+			{
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			
+			string exp_type = get_exp_type($2);
+
+			$$ = new Node("RETURN");
+			
+			
+			if (exp_type == "BOOL") // If bool, backpatch the bool statement to enter true/false to the var stack position
+			{
+				code.bpatch($2->true_list,code.genLabel());
+				code.emit("li $v0, 1");
+				int quad = code.emit("j ");
+				code.bpatch($2->false_list,code.genLabel());
+				code.emit("li $v0, 0");
+				code.bpatch(code.makelist(quad), code.genLabel());
+				empty_func_stack();
+				code.emit("jr $ra");
+			}
+			
+			else {
+				code.emit("add $v0, $" + to_str($2->reg) + ", 0");
+				empty_func_stack();
+				code.emit("jr $ra");
+			}
+			
+			for (int i=8; i<=25; i++){ // Free up all registers
+				set_reg_available(i,true);
+			}
+
+		}
+		
+		|IF LPAREN BoolExp RPAREN Mlabel OpenScope Statement EndScope %prec CONFLICT // 32
+		{
+			code.bpatch($3->true_list,$5->label);
+			$$ = $7;
+			$$ -> next_list = code.merge($3->false_list,$7->next_list);
+			
+		}
+		
+		| IF LPAREN BoolExp RPAREN Mlabel OpenScope Statement EndScope ELSE N Mlabel OpenScope Statement EndScope// 33
+		{	
+			$$ = new Node("STATEMENT");
+			code.bpatch($3->true_list,$5->label);
+			code.bpatch($3->false_list,$11->label);
+			$$ -> next_list = code.merge(code.merge($7->next_list,$10->next_list),$13->next_list);
+			$$ -> break_list = code.merge($7->break_list,$13->break_list);
+			$$ -> continue_list = code.merge($7->continue_list,$13->continue_list);
+			
+			
+		}
+		
+		| WHILE LPAREN Mlabel BoolExp RPAREN OpenWhile OpenScope Mlabel Statement Mlabel EndScope  // 34
+		{
+			while_tables->pop_back();
+			$$ = new Node("STATEMENT");
+			code.bpatch($9->next_list,$10->label);
+			code.bpatch($9->continue_list,$10->label);
+			code.bpatch($4->true_list,$8->label);
+			
+			$$->next_list = code.merge($4->false_list,$9->break_list);
+			
+			code.emit("j " + $3->label);
+		}
+		
+		| BREAK SC // 35
+		{
+			if (while_tables->size()==0)
+			{
+				errorUnexpectedBreak(yylineno);
+				exit(0);
+			}
+			
+			empty_while_stack(while_tables->back());
+			
+			$$ = new Node("BREAK");
+			$$ -> break_list = code.makelist(code.emit("j "));
+		}
+		
+		| CONTINUE SC // 36
+		{
+			if (while_tables->size()==0)
+			{
+				errorUnexpectedContinue(yylineno);
+				exit(0);
+			}
+			
+			$$ = new Node("COTINUTE");
+			$$ -> continue_list = code.makelist(code.emit("j  "));
+		}
+		;
+		
+		
+Call	: ID LPAREN ExpList RPAREN // 37
+
+		{
+			string id = dynamic_cast<Value_node*>($1)->value;
+			Info* info = get_info(id);
+			
+			if (info==NULL || info->arg_types==NULL){
+				errorUndefFunc(yylineno,id);
+				exit(0);
+			}
+			
+			vector<string>* expect = (info->arg_types);
+			vector<string>* received = dynamic_cast<Exp_list*>($3)->types;
+			vector<int>* places = dynamic_cast<Exp_list*>($3)->places;
+			
+			check_params(*expect,*received,id);
+			
+			vector<int> backup_regs;
+			bool found = false;
+			
+			for (int i=8; i<=25; i++){ // Backing up used registers
+				
+				found = false;
+				
+				for (int j=0; j<received->size();j++){ // check if register is used for arguments
+					if (get_struct_info(received->at(j)) == NULL && places->at(j) == i) found=true;
+				}
+				
+				if (av_regs[i] == false && !found){ // if register is used, and not for an argument, backup
+					code.emit("subu $sp, $sp, 4");
+					code.emit("sw $" + to_str(i) + ", ($sp)");
+					backup_regs.push_back(i);
+				}
+			}
+			
+			code.emit("subu $sp, $sp, 4");
+			code.emit("sw $fp, ($sp)");
+			code.emit("subu $sp, $sp, 4");
+			code.emit("sw $ra, ($sp)");
+			
+			// Add arguments:
+			
+			int added_args = 0;
+			
+			for (int i=received->size()-1; i>=0; i--){
+				Info* struct_info = get_struct_info(received->at(i));
+				if (struct_info == NULL){
+					code.emit("subu $sp, $sp, 4");
+					code.emit("sw $"+ to_str(places->at(i)) + ", ($sp)");
+					added_args++;
+					set_reg_available(places->at(i),true);
+				}
+				else{
+					
+					int reg = get_free_reg();
+					 for (int j=0; j<struct_info->struct_fields->size();j++){
+					//for (int j=struct_info->struct_fields->size()-1; j >=0; j--){
+						code.emit("lw $" + to_str(reg) + ", "+ to_str(4*(places->at(i)-j))+ "($fp)");
+						code.emit("subu $sp, $sp, 4");
+						code.emit("sw $" + to_str(reg) + ", 0($sp)"); 
+						added_args++;
+					}
+					
+					set_reg_available(reg,true);
+				}
+			}
+			
+			
+			for (int i=8; i<=25; i++){ // Free up all registers
+				set_reg_available(i,true);
+			}
+			
+			code.emit("subu $fp, $sp, 4"); // move the fp
+			
+			if (id != "main") id = id + "_";
+			code.emit("jal " + id);
+			
+			//code.emit("addu $sp, $sp, " + to_str(4*added_args));
+			
+			code.emit("lw $ra, ($sp)");
+			code.emit("addu $sp, $sp, 4");
+			code.emit("lw $fp, ($sp)");
+			code.emit("addu $sp, $sp, 4");
+			
+			for(int i=backup_regs.size() -1; i>=0; i--){ // Restore registers
+				code.emit("lw $" + to_str(backup_regs.at(i)) + ", ($sp)");
+				code.emit("addu $sp, $sp, 4");
+				set_reg_available( backup_regs.at(i), false);
+			}
+			
+			if (info->type == "BOOL"){
+				int quad = code.emit("beq $v0, 0, ");
+				$$->true_list = code.makelist(code.emit("j "));
+				code.bpatch(code.makelist(quad),code.genLabel());
+				$$->false_list=code.makelist(code.emit("j "));
+			}
+			
+			else{
+				int reg = get_free_reg();
+				code.emit("add $" + to_str(reg) + ", $v0, 0");
+				$$->reg = reg;
+			}
+			
+		}
+		
+		| ID LPAREN RPAREN // 38
+		{
+			string id = dynamic_cast<Value_node*>($1)->value;
+			Info* info = get_info(id);
+			
+			if (info == NULL || info->arg_types==NULL){
+				errorUndefFunc(yylineno,id);
+				exit(0);
+			}
+			vector<string>* empty = new vector<string>();
+			if (info->arg_types->size() != 0)
+			{
+				errorPrototypeMismatch(yylineno,id,*(add_struct_to_args(info->arg_types)));
+				exit(0);
+			}
+			
+			$$ = new Node(info->type);	
+			
+			vector<int> backup_regs; 
+			
+			for (int i=8; i<=25; i++){ // Backing up used registers
+				if (av_regs[i] == false){
+					code.emit("subu $sp, $sp, 4");
+					code.emit("sw $" + to_str(i) + ", ($sp)");
+					backup_regs.push_back(i);
+				}
+			}
+			
+			code.emit("subu $sp, $sp, 4");
+			code.emit("sw $fp, ($sp)");
+			code.emit("subu $sp, $sp, 4");
+			code.emit("sw $ra, ($sp)");
+			
+			for (int i=8; i<=25; i++){ // Free up all registers
+				set_reg_available(i,true);
+			}
+			
+			code.emit("subu $fp, $sp, 4"); // move the fp
+			
+			if (id != "main") id = id + "_";
+			code.emit("jal " + id);
+			
+			code.emit("lw $ra, ($sp)");
+			code.emit("addu $sp, $sp, 4");
+			code.emit("lw $fp, ($sp)");
+			code.emit("addu $sp, $sp, 4");
+			
+			for(int i=backup_regs.size() -1; i>=0; i--){ // Restore registers
+				set_reg_available(backup_regs.at(i),false);
+				code.emit("lw $" + to_str(backup_regs.at(i)) + ", ($sp)");
+				code.emit("addu $sp, $sp, 4");
+			}
+			
+			
+			
+			if (info->type == "BOOL"){
+				int quad = code.emit("beq $v0, 0, ");
+				$$->true_list = code.makelist(code.emit("j "));
+				code.bpatch(code.makelist(quad),code.genLabel());
+				$$->false_list=code.makelist(code.emit("j "));
+			}
+			
+			else{
+				int reg = get_free_reg();
+				code.emit("add $" + to_str(reg) + ", $v0, 0");
+				$$->reg = reg;
+			}
+			
+		}
+		;
+
+		
+ExpList : Exp // 39
+
+		{
+			
+			string exp_type = get_exp_type($1);
+			
+			int place;
+			
+			if (exp_type == "BOOL"){
+				place = get_free_reg();
+				code.bpatch($1->true_list,code.genLabel());
+				code.emit("li $" + to_str(place) + ", 1");
+				int quad = code.emit("j  ");
+				code.bpatch($1->false_list,code.genLabel());
+				code.emit("li $" + to_str(place) + ", 0");
+				code.bpatch(code.makelist(quad),code.genLabel());
+			}
+			
+			else if(exp_type == "STRING"){
+				place = get_free_reg();
+				code.emit("la $" + to_str(place) + ", " + $1->label);
+			}
+			
+			else if (get_struct_info(exp_type) != NULL){
+				place = -1*(get_info(dynamic_cast<Value_node*>($1)->value)->offset);
+			}
+			
+			else place = $1->reg;
+			
+			$$ = new Exp_list(exp_type,place);
+			
+			
+			
+		}
+		
+		| AddExp COMMA ExpList // 40
+		{
+			// HW5
+			$$ = $1;
+			
+			vector<string>* types = dynamic_cast<Exp_list*>($3)->types;
+			vector<int>* places = dynamic_cast<Exp_list*>($3)->places;
+			
+			for (int i=0; i<types->size(); i++)
+			{
+				dynamic_cast<Exp_list*>($$)->types->push_back(types->at(i));
+				dynamic_cast<Exp_list*>($$)->places->push_back(places->at(i));
+			}
+		}
+		;
+		
+AddExp:	Exp	
+		{
+			// HW5
+			
+			string exp_type = get_exp_type($1);
+			
+			int place;
+			
+			if (exp_type == "BOOL"){
+				place = get_free_reg();
+				code.bpatch($1->true_list,code.genLabel());
+				code.emit("li $" + to_str(place) + ", 1");
+				int quad = code.emit("j  ");
+				code.bpatch($1->false_list,code.genLabel());
+				code.emit("li $" + to_str(place) + ", 0");
+				code.bpatch(code.makelist(quad),code.genLabel());
+			}
+			
+			else if(exp_type == "STRING"){
+				place = get_free_reg();
+				code.emit("la $" + to_str(place) + ", " + $1->label);
+			}
+			
+			else if (get_struct_info($1->type) != NULL) place = -1*(get_info(dynamic_cast<Value_node*>($1)->value)->offset);
+			
+			else place = $1->reg;
+			
+			$$ = new Exp_list(exp_type,place);
+		}
+		
+		
+		
+Type :	INT // 41
+		{
+			$$ = new Node("INT");			
+		}
+			
+		| BYTE // 42
+		{
+		$$ = new Node("BYTE");
+		}
+		
+		| BOOL // 43
+		{
+			$$ = new Node("BOOL");
+		}
+		;
+		
+StructType: STRUCT ID // 44
+		{
+			string id = dynamic_cast<Value_node*>($2)->value;
+			if (get_struct_info(id)==NULL)
+			{
+				errorUndefStruct(yylineno,id);
+				exit(0);
+			}
+			$$ = new Node(id);
+		}
+		;
+		
+Exp  :	LPAREN Exp RPAREN // 45
+		{
+			$$ = $2;
+		}
+			
+		| Call // 49
+		{
+			$$ = $1;
+			
+		}
+			
+		| Exp MULDIV Exp // 46
+		{
+			string type1 = get_exp_type($1);
+			string type3 = get_exp_type($3);
+			string binop = dynamic_cast<Value_node*>($2)->value;
+			
+			if ((type1 != "INT" && type1 != "BYTE") || (type3 != "INT" && type3 != "BYTE")) 
+			{
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			
+			string res_type;
+			
+			if (type1 == "INT" || type3=="INT" ) 
+				res_type = "INT";
+			else res_type = "BYTE";
+			
+			$$ = new Node(res_type);
+			
+			string cmd;
+			
+			if (binop == "*"){
+				cmd = "mul ";
+			}
+			
+			else // binop == "/"
+			{	
+				code.emit("beqz $" + to_str($3->reg) + ", div_zero");
+				
+				cmd = "div ";
+			}				
+			
+			code.emit(cmd + " $" + to_str($1->reg) + ", $" + to_str($1->reg) + ", $" + to_str($3->reg));
+			set_reg_available($3->reg,true); // Free second expression register
+			
+			if (res_type=="BYTE"){
+				code.emit("and $" + to_str($1->reg) + ", $" + to_str($1->reg) + ", 255");
+			}
+			
+			$$->reg = $1->reg;
+		}
+		
+		| Exp ADDSUB Exp // 46
+		{
+			string type1 = get_exp_type($1);
+			string type3 = get_exp_type($3);
+			string binop = dynamic_cast<Value_node*>($2)->value;
+			
+			if ((type1 != "INT" && type1 != "BYTE") || (type3 != "INT" && type3 != "BYTE")) 
+			{
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			
+			string res_type;
+			
+			if (type1 == "INT" || type3=="INT" ) 
+				res_type = "INT";
+			else res_type = "BYTE";
+			
+			$$ = new Node(res_type);
+			
+			string cmd;
+			
+			if (binop == "+"){
+				cmd = "addu ";
+			}
+			
+			else // binop == "-"
+			{
+				cmd ="subu ";
+			}		
+			
+			code.emit(cmd + " $" + to_str($1->reg) + ", $" + to_str($1->reg) + ", $" + to_str($3->reg));
+			set_reg_available($3->reg,true); // Free second expression register
+			
+			if (res_type=="BYTE"){
+				code.emit("and $" + to_str($1->reg) + ", $" + to_str($1->reg) + ", 255");
+			}
+			
+			$$->reg = $1->reg;
+		}
+			
+		| ID // 47
+		{
+			Info* info = get_info(dynamic_cast<Value_node*>($1)->value);
+			if (info==NULL || info->arg_types!=NULL)
+			{
+				errorUndef(yylineno,dynamic_cast<Value_node*>($1)->value);
+				exit(0);
+			}
+			
+			$$ = $1;
+			
+			// HW5:
+			
+			if (get_struct_info(info->type) == NULL){ // Not of type struct
+				
+				int reg = get_free_reg();
+
+				code.emit("lw $" + to_str(reg) + ", " + to_str((-4) * (info->offset)) + "($fp)");
+				
+				if (info->type == "BOOL"){
+					$$ -> true_list = code.makelist(code.emit("beq $" + to_str(reg) + ", 1,  "));
+					$$ -> false_list = code.makelist(code.emit("j  "));
+					set_reg_available(reg,true);
+				}
+				
+				else $$->reg = reg;
+			}
+		}
+		
+		|  ID PERIOD ID // 48
+		{
+			Info* info = get_info(dynamic_cast<Value_node*>($1)->value);
+			
+			if (info== NULL || get_struct_info(info->type)==NULL){
+				errorUndef(yylineno,dynamic_cast<Value_node*>($1)->value);
+				exit(0);
+			}
+			
+			int inside_offset = is_struct_field(info->type,dynamic_cast<Value_node*>($3)->value);
+			
+			if ( inside_offset == -1){
+				errorUndefStructMember(yylineno,dynamic_cast<Value_node*>($1)->value);
+				exit(0);
+			}
+						
+			$$ = new Node(get_struct_field_type(info->type,dynamic_cast<Value_node*>($3)->value));
+			
+			// HW5
+			
+			int reg = get_free_reg();
+			
+			
+			code.emit("lw $" + to_str(reg) + ", " + to_str(-4 * (info->offset + inside_offset)) + "($fp)");
+				
+			if (info->type == "BOOL"){
+				$$ -> true_list = code.makelist(code.emit("beq $" + to_str(reg) + ", 1,  "));
+				$$ -> false_list = code.makelist(code.emit("j  "));
+				set_reg_available(reg,true);
+			}
+				
+			else $$->reg = reg;
+		}
+
+		| NUM // 50
+		{
+			$$ = $1;
+			
+			// HW5:
+			
+			$$->reg = get_free_reg();
+			
+			code.emit("li $" + to_str($$->reg) + ", " + dynamic_cast<Value_node*>($1)->value);
+
+		}
+		
+		| NUM B // 51
+		{
+			int num = atoi((dynamic_cast<Value_node*>($1)->value).c_str());
+			if (num > 255){
+				errorByteTooLarge(yylineno, dynamic_cast<Value_node*>($1)->value);
+				exit(0);
+			}
+			
+			$$ = new Value_node("BYTE",dynamic_cast<Value_node*>($1)->value);
+			
+			// HW5:
+			
+			$$->reg = get_free_reg();
+			
+			code.emit("li $" + to_str($$->reg) + ", " + dynamic_cast<Value_node*>($1)->value);
+		}
+		
+		| STRING // 52
+		{
+			
+			$$ = new Node("STRING");
+			
+			// HW5:
+			
+			string label = "string_"+to_str(string_count++);
+
+			code.emitData(label+": .asciiz " + dynamic_cast<Value_node*>($1)->value);
+			
+			$$->label = label;
+		}
+		
+		| TRUE // 53
+		{
+			$$ = new Node("BOOL");
+			
+			// HW5
+			
+			$$->true_list = code.makelist(code.emit("j "));
+		}
+		
+		| FALSE // 54
+		{
+			$$ = new Node("BOOL");
+			
+			// HW5
+			
+			$$->false_list = code.makelist(code.emit("j "));
+		}
+		
+		| NOT Exp //55
+		{
+			check_exp_type($2,"BOOL");
+			
+			$$ = new Node("BOOL");
+			
+			// HW5
+			
+			$$->true_list = $2->false_list;
+			$$->false_list = $2->true_list;
+		}
+		
+		| Exp AND Mlabel Exp // 56
+		{
+			check_exp_type($1,"BOOL");
+			check_exp_type($4,"BOOL"); // Changed for hw5
+			
+			$$ = new Node("BOOL");
+			
+			// HW5
+			
+			code.bpatch($1->true_list,$3->label);
+			$$->true_list=$4->true_list;
+			$$->false_list=code.merge($1->false_list,$4->false_list);
+		}
+		
+		| Exp OR Mlabel Exp // 57
+		{
+			check_exp_type($1,"BOOL");
+			check_exp_type($4,"BOOL");
+			
+			$$ = new Node("BOOL");
+			
+			// HW5
+			
+			code.bpatch($1->false_list,$3->label);
+			$$->true_list=code.merge($1->true_list,$4->true_list);
+			$$->false_list=$4->false_list;
+			
+		}
+		
+		| Exp RELOPL Exp // 58
+		{
+			string type1 = get_exp_type($1);
+			string type3 = get_exp_type($3);
+			
+			if ((type1 != "INT" && type1 != "BYTE") || (type3 != "INT" && type3 != "BYTE")) 
+			{
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			
+			$$ = new Node("BOOL");
+			
+			// HW5
+			
+			if ($2->type == "=="){
+				$$ -> true_list = code.makelist(code.emit("beq $" + to_str($1->reg) + ", $" + to_str($3->reg) + ",  ")); 
+			}
+			
+			else if ($2->type == "!="){
+				$$ -> true_list = code.makelist(code.emit("bne $" + to_str($1->reg) + ", $" + to_str($3->reg) + ",  ")); 
+			}
+			
+			$$->false_list = code.makelist(code.emit("j "));
+			
+			set_reg_available($1->reg,true);
+			set_reg_available($3->reg,true);
+			
+		}
+		
+		| Exp RELOPN Exp // 58
+		{
+			string type1 = get_exp_type($1);
+			string type3 = get_exp_type($3);
+			
+			if ((type1 != "INT" && type1 != "BYTE") || (type3 != "INT" && type3 != "BYTE")) 
+			{
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			
+			$$ = new Node("BOOL");
+			
+			if ($2->type == "<"){
+				$$ -> true_list = code.makelist(code.emit("blt $" + to_str($1->reg) + ", $" + to_str($3->reg) + ",  ")); 
+			}
+			
+			else if ($2->type == ">"){
+				$$ -> true_list = code.makelist(code.emit("bgt $" + to_str($1->reg) + ", $" + to_str($3->reg) + ",  ")); 
+			}
+			
+			else if ($2->type == "<="){
+				$$ -> true_list = code.makelist(code.emit("ble $" + to_str($1->reg) + ", $" + to_str($3->reg) + ",  ")); 
+			}
+			
+			else if ($2->type == ">="){
+				$$ -> true_list = code.makelist(code.emit("bge $" + to_str($1->reg) + ", $" + to_str($3->reg) + ",  ")); 
+			}
+			
+			$$->false_list = code.makelist(code.emit("j "));
+			
+			set_reg_available($1->reg,true);
+			set_reg_available($3->reg,true);
+		}
+		;
+
+%%
+
+Info* get_struct_info(string id){
+	Info* info = get_info(id);
+	if (info==NULL || info->type!="STRUCT") return NULL;
+	else return info;
+}
+
+void check_exp_type(YYSTYPE exp, string type){
+	if (get_exp_type(exp)!=type)
+	{
+		errorMismatch(yylineno);
+		exit(0);
+	}
+}
+
+void check_params(vector<string> expect, vector<string> recieved,string id){
+	
+	if (expect.size() != recieved.size()){
+		errorPrototypeMismatch(yylineno,id,*add_struct_to_args(&expect));
+		exit(0);
+	}
+	for (int i=0; i<expect.size() ; i++){
+		if (expect.at(i)!=recieved.at(i))
+		{
+			if (!(expect.at(i)=="INT" && recieved.at(i)=="BYTE"))
+			{
+				errorPrototypeMismatch(yylineno,id,*add_struct_to_args(&expect));
+				exit(0);
+			}
+		}
+	}
+}
+
+void check_id_free(string id){
+	
+	if (get_info(id) != NULL){
+		errorDef(yylineno,id);
+		exit(0);
+	}
+}
+
+int is_struct_field(string struct_name,string field){
+	
+	Info* struct_info = get_struct_info(struct_name);
+	
+	vector<string> arg_names = *(get_struct_fields(*(struct_info->struct_fields),2));
+	for (int i=0;i<arg_names.size();i++)
+	{
+		if (arg_names.at(i)==field) return i;
+	}
+	return -1;
+	//return (find(arg_names.begin(),arg_names.end(),field) != arg_names.end());
+	
+}
+
+string get_struct_field_type(string struct_ID, string name){ // Assume name is a valid struct field name.
+	
+	Info* info = get_struct_info(struct_ID);
+	vector< pair<string, string> > struct_fields = *(info->struct_fields);
+	vector< pair<string, string> >::iterator it = struct_fields.begin();
+	
+	for (; it!=struct_fields.end(); ++it){
+		if (it->second == name) return it->first;
+	}
+	
+	return "";
+}
+
+string get_exp_type(YYSTYPE exp){
+	if (exp->type == "ID"){
+		Info* info = get_info(dynamic_cast<Value_node*>(exp)->value);
+		return info->type;
+	}
+	else return exp->type;
+}
+
+Info* get_info(string name){
+		
+	vector < SymbolTable* >* temp= new vector < SymbolTable* >(*tables);
+
+	while (temp->size() > 0)
+	{
+		SymbolTable* current_table = temp->back();
+		
+		
+		for (SymbolTable::iterator it = current_table->begin(); it!=current_table->end();++it){
+			
+			if ((*it)->name==name) return *it;
+		}
+		
+		temp->pop_back();
+
+	}
+				
+
+	return NULL;
+}
+
+vector<string>* get_struct_fields(vector< pair <string, string> > fields, int x){ // Assume x is 1 or 2.
+	vector<string>* result = new vector<string>();
+	
+	vector< pair <string, string> >::iterator it = fields.begin();
+	
+	for (; it!=fields.end(); ++it){
+		if (x==1) {
+			if (get_struct_info(it->first)!=NULL)
+				result->push_back("struct "+(it->first));
+			else result->push_back(it->first);
+		}
+		else if (x==2) result->push_back(it->second);
+	}
+	
+	return result;
+}
+
+void end_scope(){
+	
+	// HW5
+	
+	code.emit("#end_scope()");
+	
+	empty_stack(tables->back());
+
+	offset_stack->pop();
+	tables->pop_back();
+	
+}
+
+vector <string>* add_struct_to_args(vector<string>* args){
+	
+	vector <string>* new_args = new vector<string>();
+	
+	for (vector<string>::iterator it = args->begin();it!=args->end();++it)
+	{
+		if (get_struct_info(*it)!=NULL) {
+			new_args->push_back("struct "+*it);
+		}
+		else {
+			new_args->push_back(*it);
+		}
+	}
+	
+	return new_args;
+}
+
+/* HW5 Functions: */
+
+void init_regs(){
+	for (int i=0; i<=25; i++){
+		av_regs[i] = true;
+	}
+}
+
+// Move to available if b = true, or to used else
+void set_reg_available(int i, bool b){
+	av_regs[i] = b;
+}
+
+int get_free_reg(){
+	for (int i=8; i<= 25; i++){
+		if (av_regs[i]){
+			av_regs[i]=false;
+			return i;
+		}
+	}
+	return -1; // No available register
+}
+
+bool is_reg_free(int i){
+	return av_regs[i];
+}
+
+string to_str(int num){
+	
+	stringstream st;
+	st << num;
+	return (st.str());
+}
+
+void empty_stack(SymbolTable* current_table){
+	
+	int size = 0;
+	
+	Info* info = NULL;
+
+	for (SymbolTable::iterator it = current_table->begin() ; it!=current_table->end(); ++it){
+		info = (*it);
+		if (info->type != "STRUCT" && info->arg_types == NULL){	// Not a struct or a function
+			Info* struct_info = get_struct_info(info->type);
+			if (struct_info!=NULL) size += struct_info->struct_fields->size(); // Of type struct
+			else size++; // Of regular type
+		}
+	}		
+	
+	if (size>0) code.emit("addu $sp, $sp, " + to_str(size*4));
+	
+}
+
+void empty_func_stack(){
+	for (int i=tables->size()-1; i>0; i--){
+		empty_stack(tables->at(i));
+	}
+}
+
+void empty_while_stack(int index){
+	
+	code.emit("#emptying while stack:");
+		
+	for (int i=tables->size(); i>index; i--){
+		code.emit("#--------"+to_str(i));
+		empty_stack(tables->at(i-1));
+	}
+}
+
+
+/** Main functions: **/
+
+int main()
+{
+	//yydebug=1;
+
+	yyparse();
+	
+	code.printDataBuffer();
+	code.printCodeBuffer();
+	
+	
+}
+
+void yyerror(const char * message)
+{
+	errorSyn(yylineno);
+	exit(0);
+}
